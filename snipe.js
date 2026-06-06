@@ -1241,7 +1241,7 @@ async function showMainMenu(ctx, edit = false) {
     : `💼 *Wallet ${session.activeWalletIndex + 1}/${session.wallets.length}*\n\`${shortenAddress(wallet.publicKey)}\`\n💰 ${balance?.toFixed(4) || '?'} SOL ${solPrice ? `($${usdValue.toFixed(2)})` : ''} ${errMsg}`;
 
   const text = `
-🚀 *Welcome to Solbix Trading Bot* 🤖
+🚀 *Welcome to Trojan Trading Bot* 🤖
 
 The most easy your Web3 execution engine.
 AI-driven. Battle-tested. Locked down.
@@ -1256,7 +1256,7 @@ AI-driven. Battle-tested. Locked down.
 ━━━━━━━━━━━━━━━━━━
 ${walletLine}
 
-🏦 *Solbix your fast sniper bot*
+🏦 *Trojan your fast sniper bot*
 Paste any Solana contract address to analyze
   `;
 
