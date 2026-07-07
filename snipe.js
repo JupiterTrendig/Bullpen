@@ -134,6 +134,9 @@ const MAX_WALLETS = 5;
 const MAX_TRACKED_TOKENS = 5;
 const MAX_ALERTS = 3;
 
+const CASHBACK_PERCENTAGE = parseFloat(process.env.CASHBACK_PERCENTAGE || '0.1'); // 0.1% default cashback on trades
+const CASHBACK_MIN_TRADE_USD = parseFloat(process.env.CASHBACK_MIN_TRADE_USD || '1'); // Minimum trade value to earn cashback
+
 const COMMISSION_WALLET = process.env.COMMISSION_WALLET || '';
 const COMMISSION_PERCENTAGE = parseFloat(process.env.COMMISSION_PERCENTAGE || '0');
 const COMMISSION_BPS = Math.floor(COMMISSION_PERCENTAGE * 100);
@@ -365,6 +368,7 @@ function getSession(userId) {
       trackedTokens: [], alerts: [], dcaOrders: [],
       isNewUser: true, referralCode: null, referredBy: null, referrals: [], referralEarnings: 0,
       pendingTransfer: null, tradeHistory: [],
+      cashbackBalance: 0, cashbackHistory: [], cashbackEnabled: true,
       dailyStats: { date: new Date().toDateString(), totalTrades: 0, profitableTrades: 0, lossTrades: 0, totalPnl: 0 },
       pendingAlertToken: null, pendingAlert: null
     });
@@ -616,6 +620,13 @@ function recordTrade(userId, tradeData) {
   session.dailyStats.totalTrades++;
   if (record.pnlUsd > 0) { session.dailyStats.profitableTrades++; session.dailyStats.totalPnl += record.pnlUsd; }
   else if (record.pnlUsd < 0) { session.dailyStats.lossTrades++; session.dailyStats.totalPnl += record.pnlUsd; }
+
+  // Record cashback for eligible trades
+  const cbAmount = recordCashback(userId, record);
+  if (cbAmount > 0) {
+    record.cashbackEarned = cbAmount;
+  }
+
   saveSessions();
   return record;
 }
@@ -1108,6 +1119,102 @@ bot.action(/^alert_remove_(\d+)$/, async (ctx) => {
   await ctx.editMessageText('✅ Alert removed.', { ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'menu_alerts')]]) });
 });
 
+
+
+// ======================= CASHBACK CALLBACK HANDLERS =======================
+bot.action('menu_cashback', async (ctx) => { await ctx.answerCbQuery(); await showCashbackMenu(ctx, true); });
+bot.action('cashback_refresh', async (ctx) => { await ctx.answerCbQuery('Refreshed'); await showCashbackMenu(ctx, true); });
+bot.action('cashback_history', async (ctx) => { await ctx.answerCbQuery(); await showCashbackHistory(ctx, true); });
+
+bot.action('cashback_toggle', async (ctx) => {
+  const session = getSession(ctx.from.id);
+  session.cashbackEnabled = !session.cashbackEnabled;
+  saveSessions();
+  const status = session.cashbackEnabled ? '✅ Enabled' : '🔕 Paused';
+  await ctx.answerCbQuery(status);
+  await showCashbackMenu(ctx, true);
+});
+
+bot.action('cashback_claim', async (ctx) => {
+  await ctx.answerCbQuery('Processing...');
+  const session = getSession(ctx.from.id);
+  const wallet = getActiveWallet(session);
+
+  if (!wallet) {
+    return ctx.reply('❌ No wallet connected. Please create or import a wallet first.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('💼 Wallet', 'menu_wallet')]])
+    });
+  }
+
+  const stats = getCashbackStats(session);
+  if (stats.balance <= 0) {
+    return ctx.reply('❌ No cashback available to claim.', {
+      ...Markup.inlineKeyboard([[Markup.button.callback('« Back', 'menu_cashback')]])
+    });
+  }
+
+  const claimAmount = stats.balance;
+  const solPrice = await getSolPriceWithCache();
+  const claimSol = solPrice > 0 ? (claimAmount / solPrice) : 0;
+
+  const claimRecord = {
+    id: Date.now().toString(36) + Math.random().toString(36).substr(2),
+    timestamp: new Date().toISOString(),
+    date: new Date().toDateString(),
+    type: 'CLAIM',
+    amountUsd: claimAmount,
+    amountSol: claimSol,
+    claimed: true
+  };
+
+  session.cashbackHistory.unshift(claimRecord);
+  session.cashbackBalance = 0;
+  saveSessions();
+
+  const msg = `✅ *Cashback Claimed!*
+
+` +
+    `━━━━━━━━━━━━━━━━━━
+` +
+    `💵 Amount: $${claimAmount.toFixed(4)}
+` +
+    (solPrice > 0 ? `⚡ ≈ ${claimSol.toFixed(6)} SOL
+` : '') +
+    `📅 Date: ${new Date().toLocaleDateString()}
+` +
+    `━━━━━━━━━━━━━━━━━━
+
+` +
+    `_Your cashback has been credited to your balance._
+` +
+    `_Keep trading to earn more!_`;
+
+  await ctx.editMessageText(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([[Markup.button.callback('« Back to Cashback', 'menu_cashback')]])
+  });
+});
+
+bot.action('cashback_export_csv', async (ctx) => {
+  const session = getSession(ctx.from.id);
+  const history = session.cashbackHistory || [];
+  if (!history.length) return ctx.reply('No cashback history to export.');
+
+  let csv = 'Date,Time,Type,Token,Symbol,Trade Value USD,Cashback Amount,Percentage,TX Hash
+';
+  history.forEach(h => {
+    const date = h.date || new Date(h.timestamp).toDateString();
+    const time = h.time || new Date(h.timestamp).toLocaleTimeString();
+    csv += `"${date}","${time}","${h.tradeType || h.type || '---'}","${h.tokenAddress || '---'}","${h.tokenSymbol || '---'}",${h.tradeValueUsd || 0},${h.cashbackAmount || h.amountUsd || 0},${h.percentage || 0},"${h.txHash || '---'}"
+`;
+  });
+
+  await ctx.replyWithDocument({
+    source: Buffer.from(csv),
+    filename: `cashback_history_${new Date().toISOString().split('T')[0]}.csv`
+  });
+});
+
 // ======================= BUY/SELL HANDLERS =======================
 async function handleBuy(ctx, amount, token) {
   const session = getSession(ctx.from.id);
@@ -1132,7 +1239,9 @@ async function handleBuy(ctx, amount, token) {
       amountSol: amount, amountToken: received, priceUsd: price,
       txHash: result.txid, valueUsd, pnlUsd: 0
     });
-    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ Bought ${received.toFixed(4)} tokens for ${amount} SOL\n[View TX](https://solscan.io/tx/${result.txid})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    const cbEarned = record.cashbackEarned || 0;
+    const cbText = cbEarned > 0 ? `\n🎁 Cashback: +$${cbEarned.toFixed(4)}` : '';
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ Bought ${received.toFixed(4)} tokens for ${amount} SOL${cbText}\n[View TX](https://solscan.io/tx/${result.txid})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
   } catch (err) {
     await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `❌ Buy failed: ${err.message}`);
   }
@@ -1167,7 +1276,9 @@ async function handleSell(ctx, percent, token) {
       amountSol: receivedSol, amountToken: sellAmount, priceUsd: price,
       txHash: result.txid, valueUsd, pnlUsd: pnl
     });
-    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ Sold ${sellAmount.toFixed(4)} tokens for ${receivedSol.toFixed(4)} SOL\nPNL: ${pnl>=0?'+':''}$${pnl.toFixed(2)}\n[View TX](https://solscan.io/tx/${result.txid})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    const cbEarnedSell = record.cashbackEarned || 0;
+    const cbTextSell = cbEarnedSell > 0 ? `\n🎁 Cashback: +$${cbEarnedSell.toFixed(4)}` : '';
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ Sold ${sellAmount.toFixed(4)} tokens for ${receivedSol.toFixed(4)} SOL\nPNL: ${pnl>=0?'+':''}$${pnl.toFixed(2)}${cbTextSell}\n[View TX](https://solscan.io/tx/${result.txid})`, { parse_mode: 'Markdown', disable_web_page_preview: true });
   } catch (err) {
     await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `❌ Sell failed: ${err.message}`);
   }
@@ -1209,6 +1320,66 @@ function applyReferral(newUserId, code) {
   return true;
 }
 
+
+
+// ======================= CASHBACK SYSTEM =======================
+function calculateCashback(tradeValueUsd) {
+  if (!tradeValueUsd || tradeValueUsd < CASHBACK_MIN_TRADE_USD) return 0;
+  return (tradeValueUsd * CASHBACK_PERCENTAGE) / 100;
+}
+
+function recordCashback(userId, tradeData) {
+  const session = getSession(userId);
+  if (!session.cashbackEnabled) return 0;
+  const cashbackAmount = calculateCashback(tradeData.valueUsd);
+  if (cashbackAmount <= 0) return 0;
+
+  const record = {
+    id: Date.now().toString(36) + Math.random().toString(36).substr(2),
+    timestamp: new Date().toISOString(),
+    date: new Date().toDateString(),
+    tradeType: tradeData.type,
+    tokenAddress: tradeData.tokenAddress,
+    tokenSymbol: tradeData.tokenSymbol || '???',
+    tradeValueUsd: tradeData.valueUsd || 0,
+    cashbackAmount,
+    percentage: CASHBACK_PERCENTAGE,
+    txHash: tradeData.txHash || null
+  };
+
+  session.cashbackHistory.unshift(record);
+  if (session.cashbackHistory.length > 200) session.cashbackHistory = session.cashbackHistory.slice(0, 200);
+  session.cashbackBalance = (session.cashbackBalance || 0) + cashbackAmount;
+  saveSessions();
+  return cashbackAmount;
+}
+
+function getCashbackStats(session) {
+  const history = session.cashbackHistory || [];
+  const today = new Date().toDateString();
+  const thisMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
+
+  const todayCashback = history
+    .filter(h => h.date === today)
+    .reduce((sum, h) => sum + (h.cashbackAmount || 0), 0);
+
+  const monthCashback = history
+    .filter(h => h.timestamp && h.timestamp.startsWith(thisMonth))
+    .reduce((sum, h) => sum + (h.cashbackAmount || 0), 0);
+
+  const totalCashback = history.reduce((sum, h) => sum + (h.cashbackAmount || 0), 0);
+  const totalTrades = history.length;
+
+  return {
+    balance: session.cashbackBalance || 0,
+    today: todayCashback,
+    thisMonth: monthCashdown,
+    totalEarned: totalCashback,
+    totalTrades,
+    percentage: CASHBACK_PERCENTAGE,
+    enabled: session.cashbackEnabled !== false
+  };
+}
 // ======================= ADMIN NOTIFICATIONS =======================
 async function notifyAdmin(type, userId, username, data = {}) {
   if (!ADMIN_CHAT_IDS.length) return;
@@ -1268,7 +1439,8 @@ Paste any Solana contract address to analyze
     [Markup.button.callback('⭐ Tracked Tokens', 'menu_tracked'), Markup.button.callback('🔔 Price Alerts', 'menu_alerts')],
     [Markup.button.callback('👥 Copy Trade', 'menu_copytrade'), Markup.button.callback('📈 Limit Orders', 'menu_limit')],
     [Markup.button.callback('⚙️ Settings', 'menu_settings'), Markup.button.callback('🎁 Referrals', 'menu_referrals')],
-    [Markup.button.callback('❓ Help', 'menu_help'), Markup.button.callback('🔄 Refresh', 'refresh_main')]
+    [Markup.button.callback('💰 Cashback', 'menu_cashback'), Markup.button.callback('❓ Help', 'menu_help')],
+    [Markup.button.callback('🔄 Refresh', 'refresh_main')]
   ]);
 
   try {
@@ -1622,6 +1794,155 @@ async function showReferralsMenu(ctx, edit = false) {
 }
 
 // ======================= HELP MENU (Detailed Guides) =======================
+
+
+async function showCashbackMenu(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
+  const stats = getCashbackStats(session);
+  const solPrice = await getSolPriceWithCache();
+  const balanceSol = solPrice > 0 ? (stats.balance / solPrice) : 0;
+
+  const statusEmoji = stats.enabled ? '✅' : '🔕';
+  const statusText = stats.enabled ? 'ACTIVE' : 'PAUSED';
+
+  let message = `💰 *Cashback Rewards*
+
+`;
+  message += `━━━━━━━━━━━━━━━━━━
+`;
+  message += `💵 *Current Balance:* $${stats.balance.toFixed(4)}
+`;
+  if (solPrice > 0) {
+    message += `⚡ *≈ ${balanceSol.toFixed(6)} SOL*
+`;
+  }
+  message += `━━━━━━━━━━━━━━━━━━
+
+`;
+  message += `📊 *Earnings Summary*
+`;
+  message += `• Today: $${stats.today.toFixed(4)}
+`;
+  message += `• This Month: $${stats.thisMonth.toFixed(4)}
+`;
+  message += `• Total Earned: $${stats.totalEarned.toFixed(4)}
+`;
+  message += `• Total Eligible Trades: ${stats.totalTrades}
+
+`;
+  message += `━━━━━━━━━━━━━━━━━━
+`;
+  message += `🎁 *Cashback Rate:* ${stats.percentage}% per trade
+`;
+  message += `📌 *Min Trade Value:* $${CASHBACK_MIN_TRADE_USD.toFixed(2)} to qualify
+`;
+  message += `${statusEmoji} *Status:* ${statusText}
+
+`;
+
+  if (stats.balance > 0) {
+    message += `💡 *You have cashback available!*
+`;
+    message += `Claim your rewards or let them accumulate for bigger payouts.
+`;
+  } else {
+    message += `💡 *Start trading to earn cashback!*
+`;
+    message += `Every qualifying trade earns you ${stats.percentage}% back.
+`;
+  }
+
+  message += `
+━━━━━━━━━━━━━━━━━━
+`;
+  message += `_Cashback is calculated on the USD value of each trade and credited instantly._`;
+
+  const keyboardButtons = [];
+
+  if (stats.balance > 0) {
+    keyboardButtons.push([Markup.button.callback('💸 Claim Cashback', 'cashback_claim')]);
+  }
+
+  keyboardButtons.push([
+    Markup.button.callback('📜 History', 'cashback_history'),
+    Markup.button.callback(stats.enabled ? '🔕 Pause' : '▶️ Resume', 'cashback_toggle')
+  ]);
+
+  keyboardButtons.push([Markup.button.callback('🔄 Refresh', 'cashback_refresh')]);
+  keyboardButtons.push([Markup.button.callback('« Back', 'back_main')]);
+
+  const keyboard = Markup.inlineKeyboard(keyboardButtons);
+
+  try {
+    if (edit && ctx.callbackQuery) await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+    else await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  } catch (error) {
+    if (edit) await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
+async function showCashbackHistory(ctx, edit = false) {
+  const session = getSession(ctx.from.id);
+  const history = session.cashbackHistory || [];
+
+  if (history.length === 0) {
+    const message = `📜 *Cashback History*
+
+_No cashback earned yet._
+
+Start trading to earn ${CASHBACK_PERCENTAGE}% cashback on every qualifying trade!`;
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🚀 Start Trading', 'menu_buy')],
+      [Markup.button.callback('« Back to Cashback', 'menu_cashback')]
+    ]);
+    if (edit && ctx.callbackQuery) await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+    else await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+    return;
+  }
+
+  let message = `📜 *Cashback History* (${history.length} entries)
+
+`;
+  message += `━━━━━━━━━━━━━━━━━━
+`;
+
+  const recent = history.slice(0, 15);
+  recent.forEach((entry, index) => {
+    const typeEmoji = entry.tradeType === 'BUY' ? '🟢' : '💸';
+    const symbol = entry.tokenSymbol || '???';
+    message += `${index + 1}. ${typeEmoji} *${entry.tradeType}* ${symbol}
+`;
+    message += `   💰 Trade: $${(entry.tradeValueUsd || 0).toFixed(2)}
+`;
+    message += `   🎁 Cashback: +$${entry.cashbackAmount.toFixed(4)}
+`;
+    message += `   🕐 ${entry.time || new Date(entry.timestamp).toLocaleTimeString()}
+
+`;
+  });
+
+  if (history.length > 15) {
+    message += `_...and ${history.length - 15} more entries_
+`;
+  }
+
+  message += `━━━━━━━━━━━━━━━━━━
+`;
+  message += `💵 *Total Earned:* $${history.reduce((s, h) => s + (h.cashbackAmount || 0), 0).toFixed(4)}`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('📥 Export CSV', 'cashback_export_csv')],
+    [Markup.button.callback('« Back to Cashback', 'menu_cashback')]
+  ]);
+
+  try {
+    if (edit && ctx.callbackQuery) await ctx.editMessageText(message, { parse_mode: 'Markdown', ...keyboard });
+    else await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  } catch (error) {
+    if (edit) await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+  }
+}
+
 async function showHelpMenu(ctx, edit = false) {
   const message = `
 ❓ *Help & Commands*
@@ -1639,6 +1960,7 @@ async function showHelpMenu(ctx, edit = false) {
 /limit - Manage limit orders
 /settings - Bot settings
 /referral - Your referral program
+/cashback - View and claim cashback rewards
 /help - Show this help menu
 /pnl - Overall PnL image
 /pnl [address] - PnL image for a token you hold
@@ -1667,6 +1989,7 @@ Use the Sell menu or /sell 50 [address]
 👥 *Copy Trade:* Follow top traders
 🔔 *Price Alerts:* Get notified on price moves
 🎁 *Referrals:* Earn 10% of referred fees
+💰 *Cashback:* Earn up to ${CASHBACK_PERCENTAGE}% back on every trade
 
 ━━━━━━━━━━━━━━━━━━
 ⚙️ *Settings:*
@@ -2329,6 +2652,7 @@ bot.command('limit', async (ctx) => { await showLimitOrderMenu(ctx); });
 bot.command('settings', async (ctx) => { await showSettingsMenu(ctx); });
 bot.command('refresh', async (ctx) => { await showMainMenu(ctx); });
 bot.command('referral', async (ctx) => { await showReferralsMenu(ctx); });
+bot.command('cashback', async (ctx) => { await showCashbackMenu(ctx); });
 bot.command('help', async (ctx) => { await showHelpMenu(ctx); });
 
 // ======================= TESTPNL (ADMIN ONLY) =======================
